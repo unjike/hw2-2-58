@@ -180,5 +180,7 @@ int main(int argc, char** argv) {
         fsave.close();
     }
     delete[] parts;
+
+    MPI_Type_free(&PARTICLE);
     MPI_Finalize();
 }
