@@ -1,399 +1,395 @@
 #include "common.h"
 #include <mpi.h>
 #include <cmath>
+#include <algorithm>
 #include <vector>
 #include <unordered_set>
 
-// Simulation parameters and grid setup.
-const double CELL_SIZE = cutoff * 1.00001;
-int GRID_DIMENSIONS[2], LOCAL_COORDINATES[2], LOCAL_GRID_WIDTH, LOCAL_GRID_HEIGHT, GLOBAL_X_OFFSET, GLOBAL_Y_OFFSET;
-MPI_Comm WORLD_COMM;
+// Apply the force from neighbor to particle
+// static void inline __attribute__((always_inline))
+static void inline apply_force(particle_t& particle, particle_t& particle_neigh) {
+    // Calculate Distance
+    double dx = particle_neigh.x - particle.x;
+    double dy = particle_neigh.y - particle.y;
+    double r2 = dx * dx + dy * dy;
 
-// Particle management structures.
-struct ParticleCell;
-struct ParticleCellPrevious;
-struct ParticleCellPrevious {
-    ParticleCell* next = nullptr;
-};
-struct ParticleCell : ParticleCellPrevious {
-    ParticleCellPrevious* prev = nullptr;
-    particle_t* particle = nullptr;
-    int grid_index;
-};
-
-enum ParticleType {
-    OWNED,
-    GHOST
-};
-
-ParticleCellPrevious* grid_cells;
-ParticleCell* particle_cells;
-std::unordered_set<int> owned_particles, ghost_particles;
-
-// Neighbor communication structures.
-enum Axis {
-    X_AXIS = 0,
-    Y_AXIS = 1,
-    AXES = 2
-};
-enum Direction {
-    NEGATIVE = 0,
-    POSITIVE = 1,
-    DIRECTIONS = 2
-};
-
-struct NeighborBuffer {
-    particle_t* send_buffer = nullptr;
-    particle_t* receive_buffer = nullptr;
-    int send_count = 0;
-    int receive_count = 0;
-    MPI_Request send_request, receive_request;
-    MPI_Status send_status, receive_status;
-    int neighbor_rank;
-
-    void add_particle(const particle_t& p) {
-        send_buffer[send_count++] = p;
-    }
-
-    void initiate_send() {
-        MPI_Issend(send_buffer, send_count, PARTICLE, neighbor_rank, 0, WORLD_COMM, &send_request);
-    }
-
-    void complete_send() {
-        MPI_Wait(&send_request, MPI_STATUS_IGNORE);
-        send_count = 0;
-    }
-
-    void receive_particles() {
-        MPI_Probe(neighbor_rank, MPI_ANY_TAG, WORLD_COMM, &receive_status);
-        MPI_Get_count(&receive_status, PARTICLE, &receive_count);
-        MPI_Recv(receive_buffer, receive_count, PARTICLE, neighbor_rank, MPI_ANY_TAG, WORLD_COMM, &receive_status);
-    }
-};
-
-NeighborBuffer neighbor_buffers[AXES][DIRECTIONS];
-
-// Helper functions for particle cell management.
-static void inline link_particle_to_cell(ParticleCellPrevious* cell_previous, ParticleCell* cell) {
-    cell->prev = cell_previous;
-    cell->next = cell_previous->next;
-    if (cell_previous->next != nullptr)
-        cell_previous->next->prev = cell;
-    cell_previous->next = cell;
-}
-
-static void inline unlink_particle_from_cell(ParticleCell* cell) {
-    cell->prev->next = cell->next;
-    if (cell->next != nullptr)
-        cell->next->prev = cell->prev;
-}
-
-// Physics functions.
-static void inline apply_particle_interaction(particle_t& p1, particle_t& p2) {
-    double dx = p2.x - p1.x;
-    double dy = p2.y - p1.y;
-    double distance_squared = dx * dx + dy * dy;
-
-    if (distance_squared > cutoff * cutoff)
+    // Check if the two particles should interact
+    if (r2 > cutoff * cutoff)
         return;
 
-    distance_squared = std::max(distance_squared, min_r * min_r);
-    double distance = sqrt(distance_squared);
+    r2 = std::max(r2, min_r * min_r);
+    double r = sqrt(r2);
 
-    double interaction_coefficient = (1 - cutoff / distance) / distance_squared / mass;
-    p1.ax += interaction_coefficient * dx;
-    p1.ay += interaction_coefficient * dy;
-    p2.ax -= interaction_coefficient * dx;
-    p2.ay -= interaction_coefficient * dy;
+    // Very simple short-range repulsive force
+    double coef = (1 - cutoff / r) / r2 / mass;
+    particle.ax += coef * dx;
+    particle.ay += coef * dy;
+    particle_neigh.ay -= coef * dy;
+    particle_neigh.ax -= coef * dx;
 }
 
-static void inline apply_cell_interactions(particle_t* particle, int neighbor_x, int neighbor_y) {
-    int cell_index = neighbor_x + (LOCAL_GRID_WIDTH + 4) * neighbor_y;
-    for (ParticleCell* neighbor_cell = grid_cells[cell_index].next; neighbor_cell != nullptr; neighbor_cell = neighbor_cell->next) {
-        particle_t* neighbor_particle = neighbor_cell->particle;
-        apply_particle_interaction(*particle, *neighbor_particle);
-    }
-}
-
-static void inline update_particle_position(particle_t& particle, double simulation_size) {
+// Integrate the ODE
+// static void inline __attribute__((always_inline))
+static void inline move(particle_t& particle, double size) {
+    // simplified Velocity integration
+    // Energy conservation is better than explicit Euler method
     particle.vx += particle.ax * dt;
     particle.vy += particle.ay * dt;
     particle.x += particle.vx * dt;
     particle.y += particle.vy * dt;
 
-    while (particle.x < 0 || particle.x > simulation_size) {
-        particle.x = particle.x < 0 ? -particle.x : 2 * simulation_size - particle.x;
+    // Bounce from walls
+    while (particle.x < 0 || particle.x > size) {
+        particle.x = particle.x < 0 ? -particle.x : 2 * size - particle.x;
         particle.vx = -particle.vx;
     }
 
-    while (particle.y < 0 || particle.y > simulation_size) {
-        particle.y = particle.y < 0 ? -particle.y : 2 * simulation_size - particle.y;
+    while (particle.y < 0 || particle.y > size) {
+        particle.y = particle.y < 0 ? -particle.y : 2 * size - particle.y;
         particle.vy = -particle.vy;
     }
 }
 
-// Initialization and simulation functions.
-void init_simulation(particle_t* particles, int particle_count, double simulation_size, int process_rank, int process_count) {
-    MPI_Dims_create(process_count, AXES, GRID_DIMENSIONS);
-    int periodic_boundaries[2] = {false, false};
-    MPI_Cart_create(MPI_COMM_WORLD, AXES, GRID_DIMENSIONS, periodic_boundaries, false, &WORLD_COMM);
-    MPI_Cart_coords(WORLD_COMM, process_rank, AXES, LOCAL_COORDINATES);
+//Initializing Global Variables
+int global_dims[2], global_coords[2], global_xd, global_yd, global_x0, global_y0, global_lda;
+MPI_Comm global_comm;
+const double grid_step = cutoff*1.00001;
 
-    for (int axis = 0; axis < AXES; ++axis) {
-        MPI_Cart_shift(WORLD_COMM, axis, 1, &neighbor_buffers[axis][NEGATIVE].neighbor_rank, &neighbor_buffers[axis][POSITIVE].neighbor_rank);
-        for (int direction = 0; direction < DIRECTIONS; ++direction) {
-            neighbor_buffers[axis][direction].send_buffer = new particle_t[particle_count];
-            neighbor_buffers[axis][direction].receive_buffer = new particle_t[particle_count];
-        }
+//initializing custom data structures
+enum ParticleKind {
+    Owned,
+    Ghost
+};
+
+enum Dimension {
+    X_Dim = 0,
+    Y_Dim = 1,
+    Dims = 2
+};
+
+enum Direction {
+    Down = 0,
+    Up = 1,
+    Dirs = 2
+};
+
+struct ParticleNode;
+struct ParticleNodePredecessor;
+struct ParticleNodePredecessor {
+    ParticleNode* next = nullptr;
+};
+
+struct ParticleNode : ParticleNodePredecessor {
+    ParticleNodePredecessor* prev = nullptr;
+    particle_t* particle = nullptr;
+    int global_i;
+};
+
+struct Neighbor {
+    particle_t* send = nullptr;
+    particle_t* recv = nullptr;
+    int recvcnt = 0;
+    int sendcnt = 0;
+    int rank;
+    
+    MPI_Request send_req, recv_req;
+    MPI_Status send_status, recv_status;
+
+
+    void push(particle_t& particle) {
+            send[sendcnt++] = particle;
+    }
+    void begin_send() {
+        MPI_Issend(send, sendcnt, PARTICLE, rank, 0, global_comm, &send_req);
+    }
+    void finish_send() {
+        MPI_Wait(&send_req, MPI_STATUS_IGNORE);
+        sendcnt = 0;
+    }
+    void receive() {
+        MPI_Probe(rank, MPI_ANY_TAG, global_comm, &recv_status);
+        MPI_Get_count(&recv_status, PARTICLE, &recvcnt);
+        MPI_Recv(recv, recvcnt, PARTICLE, rank, MPI_ANY_TAG, global_comm, &recv_status);
+    }
+};
+
+//initializing particles and nodes in 2D grid
+Neighbor neighbors[Dims][Dirs];
+ParticleNodePredecessor* particle_grid;
+ParticleNode* particle_containers;
+std::unordered_set<int> global_parts, global_ghosts;
+
+
+// static void inline __attribute__((always_inline))
+static void inline apply_intercell_force(particle_t* const particle, const int x_prime, const int y_prime) {
+    int i_prime = x_prime+(global_xd+4)*y_prime;
+    for(ParticleNode* pc_prime = particle_grid[i_prime].next; pc_prime != nullptr; pc_prime = pc_prime->next) {
+        particle_t* particle_neigh = pc_prime->particle;
+        apply_force(*particle, *particle_neigh);
+    }
+}
+
+
+
+
+// static void inline __attribute__((always_inline))
+static void inline linkParticle(ParticleNodePredecessor* pred, ParticleNode* pc) {
+    pc->prev = pred;
+    pc->next = pred->next;
+    if (pred->next != nullptr)
+        pred->next->prev = pc;
+    pred->next = pc;
+}
+
+// static void inline __attribute__((always_inline))
+static void inline unlinkParticle(ParticleNode* pc) {
+    pc->prev->next = pc->next;
+    if (pc->next != nullptr)
+        pc->next->prev = pc->prev;
+}
+
+
+
+void init_simulation(particle_t* parts, int n_parts, double size, int rank, int num_procs) 
+{
+    // You can use this space to initialize data objects that you may need
+    // This function will be called once before the algorithm begins
+    // Do not do any particle simulation here
+    MPI_Dims_create(num_procs, Dims, global_dims);
+    int periods[2] = {false, false};
+    MPI_Cart_create(MPI_COMM_WORLD, Dims, global_dims, periods, false, &global_comm);
+    MPI_Cart_coords(global_comm, rank, Dims, global_coords);
+    for (int dim = 0; dim < Dims; ++dim) {
+      MPI_Cart_shift(global_comm, dim, 1, &neighbors[dim][0].rank, &neighbors[dim][1].rank);
+      for (int dir = 0; dir < Dirs; ++dir) {
+        neighbors[dim][dir].send = new particle_t[n_parts];
+        neighbors[dim][dir].recv = new particle_t[n_parts];
+      }
     }
 
-    int global_grid_size = static_cast<int>(simulation_size / CELL_SIZE) + 1;
-    LOCAL_GRID_WIDTH = (global_grid_size + GRID_DIMENSIONS[0] - 1) / GRID_DIMENSIONS[0];
-    LOCAL_GRID_HEIGHT = (global_grid_size + GRID_DIMENSIONS[1] - 1) / GRID_DIMENSIONS[1];
-    GLOBAL_X_OFFSET = LOCAL_COORDINATES[0] * LOCAL_GRID_WIDTH;
-    GLOBAL_Y_OFFSET = LOCAL_COORDINATES[1] * LOCAL_GRID_HEIGHT;
+    global_lda = static_cast<int>(size/grid_step)+1;
+    global_xd = (global_lda+global_dims[0]-1)/global_dims[0];
+    global_yd = (global_lda+global_dims[1]-1)/global_dims[1];
+    global_x0 = global_coords[0]*global_xd;
+    global_y0 = global_coords[1]*global_yd;
 
-    grid_cells = new ParticleCellPrevious[(LOCAL_GRID_WIDTH + 4) * (LOCAL_GRID_HEIGHT + 4)]();
-    particle_cells = new ParticleCell[particle_count]();
+    particle_grid = new ParticleNodePredecessor[(global_xd+4)*(global_yd+4)]();
+    particle_containers = new ParticleNode[n_parts]();
 
-    for (int particle_index = 0; particle_index < particle_count; ++particle_index) {
-        ParticleCell* cell = particle_cells + particle_index;
-        particle_t* particle = particles + particle_index;
+    for (int p_i = 0; p_i < n_parts; ++p_i) {
+        particle_t* particle = parts+p_i;
+        int global_x = static_cast<int>(particle->x / grid_step)-global_x0;
+        int global_y = static_cast<int>(particle->y / grid_step)-global_y0;
+        ParticleNode* pc = particle_containers+p_i;
+        
         particle->ax = particle->ay = 0;
-
-        int global_x = static_cast<int>(particle->x / CELL_SIZE) - GLOBAL_X_OFFSET;
-        int global_y = static_cast<int>(particle->y / CELL_SIZE) - GLOBAL_Y_OFFSET;
-
-        if (0 <= global_x && global_x < LOCAL_GRID_WIDTH && 0 <= global_y && global_y < LOCAL_GRID_HEIGHT) {
-            owned_particles.insert(particle_index);
-            int local_index = global_x + 2 + (LOCAL_GRID_WIDTH + 4) * (global_y + 2);
-            cell->particle = particle;
-            cell->grid_index = local_index;
-            ParticleCellPrevious* grid_cell = grid_cells + local_index;
-            link_particle_to_cell(grid_cell, cell);
+        
+        if (0 <= global_x && global_x < global_xd && 0 <= global_y && global_y < global_yd) {
+            global_parts.insert(p_i);
+            int global_i = global_x+2+(global_xd+4)*(global_y+2);
+            pc->particle= particle;
+            pc->global_i = global_i;
+            ParticleNodePredecessor* g = particle_grid+global_i;
+            linkParticle(g, pc);
         }
     }
 }
 
-// ... (rest of the code - push_ghosts, neighbor_exchange, receive_particles, simulate_one_step, gather_for_save)
-static void inline push_ghosts(Axis axis, Direction direction) {
-    NeighborBuffer& buffer = neighbor_buffers[axis][direction];
-    if (buffer.neighbor_rank != MPI_PROC_NULL) {
-        int x_start = (axis == X_AXIS && direction == POSITIVE) ? LOCAL_GRID_WIDTH - 1 : 0;
-        int x_end = (axis == X_AXIS && direction == NEGATIVE) ? 0 : LOCAL_GRID_WIDTH - 1;
-        int y_start = (axis == Y_AXIS && direction == POSITIVE) ? LOCAL_GRID_HEIGHT - 1 : 0;
-        int y_end = (axis == Y_AXIS && direction == NEGATIVE) ? 0 : LOCAL_GRID_HEIGHT - 1;
-
-        for (int y = 2 + y_start; y <= 2 + y_end; ++y) {
-            for (int x = 2 + x_start; x <= 2 + x_end; ++x) {
-                int index = x + (LOCAL_GRID_WIDTH + 4) * y;
-                for (ParticleCell* cell = grid_cells[index].next; cell != nullptr; cell = cell->next) {
-                    buffer.add_particle(*(cell->particle));
-                }
+// static void inline __attribute__((always_inline))
+static void inline push_ghosts(
+    Dimension dim, Direction dir)
+{
+    Neighbor& outgoing = neighbors[dim][dir];
+    if (outgoing.rank != MPI_PROC_NULL) {
+        int x_lo = dim == X_Dim && dir == Up ? global_xd-1 : 0;
+        int x_hi = dim == X_Dim && dir == Down ? 0 : global_xd-1;
+        int y_lo = dim == Y_Dim && dir == Up ? global_yd-1 : 0;
+        int y_hi = dim == Y_Dim && dir == Down ? 0 : global_yd-1;
+        for (int gy = 2+y_lo; gy <= 2+y_hi; ++gy) {
+          for (int gx = 2+x_lo; gx <= 2+x_hi; ++gx) {
+            int i = gx+(global_xd+4)*gy;
+            for (ParticleNode* pc = particle_grid[i].next; pc != nullptr; pc = pc->next) {
+                particle_t* particle = pc->particle;
+                outgoing.push(*particle);
             }
+          }
         }
     }
 }
 
-static void inline neighbor_exchange(Axis axis) {
-    NeighborBuffer& negative_buffer = neighbor_buffers[axis][NEGATIVE];
-    NeighborBuffer& positive_buffer = neighbor_buffers[axis][POSITIVE];
-
-    negative_buffer.initiate_send();
-    positive_buffer.receive_particles();
-    negative_buffer.complete_send();
-
-    positive_buffer.initiate_send();
-    negative_buffer.receive_particles();
-    positive_buffer.complete_send();
+// static void inline __attribute__((always_inline))
+static void inline neighbor_exchange(
+    Dimension dim)
+{
+    Neighbor& neighbor_down = neighbors[dim][Down];
+    Neighbor& neighbor_up = neighbors[dim][Up];
+    neighbor_down.begin_send();
+    neighbor_up.receive();
+    neighbor_down.finish_send();
+    neighbor_up.begin_send();
+    neighbor_down.receive();
+    neighbor_up.finish_send();
 }
 
-static void inline receive_particles(particle_t* particles, ParticleCell* particle_cells, ParticleCellPrevious* grid_cells, Axis axis, Direction direction, bool pass_y, ParticleType type) {
-    NeighborBuffer& buffer = neighbor_buffers[axis][direction];
-    if (buffer.neighbor_rank == MPI_PROC_NULL) return;
-
-    for (particle_t* received_particle = buffer.receive_buffer; received_particle < buffer.receive_buffer + buffer.receive_count; ++received_particle) {
-        int particle_index = received_particle->id - 1;
-        ParticleCell* cell = particle_cells + particle_index;
-        particle_t* particle = particles + particle_index;
-
-        int global_x = static_cast<int>(received_particle->x / CELL_SIZE) - GLOBAL_X_OFFSET;
-        int global_y = static_cast<int>(received_particle->y / CELL_SIZE) - GLOBAL_Y_OFFSET;
-
-        received_particle->ax = received_particle->ay = 0;
-
+// static void inline __attribute__((always_inline))
+static void inline receive_particles(
+    particle_t* parts, ParticleNode* particle_containers, ParticleNodePredecessor* particle_grid,
+    Dimension dim, Direction dir,
+    bool pass_y, ParticleKind kind)
+{
+    Neighbor& incoming = neighbors[dim][dir];
+    if (incoming.rank == MPI_PROC_NULL)
+        return;
+    for (particle_t* particle_recv = incoming.recv; particle_recv != incoming.recv+incoming.recvcnt; ++particle_recv) {
+        int p_i = particle_recv->id - 1;
+        ParticleNode* pc = particle_containers+p_i;
+        particle_t* particle = parts+p_i;
+        int global_x = static_cast<int>(particle_recv->x / grid_step)-global_x0;
+        int global_y = static_cast<int>(particle_recv->y / grid_step)-global_y0;
+        particle_recv->ax = particle_recv->ay = 0;
         if (pass_y) {
-            if (type != GHOST) {
-                if (global_y < 0) {
-                    neighbor_buffers[Y_AXIS][NEGATIVE].add_particle(*received_particle);
-                    continue;
-                } else if (global_y >= LOCAL_GRID_HEIGHT) {
-                    neighbor_buffers[Y_AXIS][POSITIVE].add_particle(*received_particle);
-                    continue;
-                }
+            if (kind != Ghost) {
+              if (global_y < 0) {
+                neighbors[Y_Dim][Down].push(*particle_recv);
+                continue;
+              } else if (global_y >= global_yd) {
+                neighbors[Y_Dim][Up].push(*particle_recv);
+                continue;
+              }
             } else {
-                if (global_y <= 0) {
-                    neighbor_buffers[Y_AXIS][NEGATIVE].add_particle(*received_particle);
-                } else if (global_y >= LOCAL_GRID_HEIGHT - 1) {
-                    neighbor_buffers[Y_AXIS][POSITIVE].add_particle(*received_particle);
-                }
+              if (global_y <= 0) {
+                neighbors[Y_Dim][Down].push(*particle_recv);
+              } else if (global_y >= global_yd-1) {
+                neighbors[Y_Dim][Up].push(*particle_recv);
+              }
             }
         }
-
-        if (-1 <= global_x && global_x < LOCAL_GRID_WIDTH + 1 && -1 <= global_y && global_y < LOCAL_GRID_HEIGHT + 1) {
-            if (0 <= global_x && global_x < LOCAL_GRID_WIDTH && 0 <= global_y && global_y < LOCAL_GRID_HEIGHT) {
-                owned_particles.insert(particle_index);
-            } else if (type == GHOST) {
-                ghost_particles.insert(particle_index);
+        if (-1 <= global_x && global_x < global_xd+1 && -1 <= global_y && global_y < global_yd+1) {
+            if (0 <= global_x && global_x < global_xd && 0 <= global_y && global_y < global_yd) {
+                global_parts.insert(p_i);
+            } else if (kind == Ghost) {
+                global_ghosts.insert(p_i);
             }
-
-            *particle = *received_particle;
-            cell->particle = particle;
-            int local_index = global_x + 2 + (LOCAL_GRID_WIDTH + 4) * (global_y + 2);
-            cell->grid_index = local_index;
-            ParticleCellPrevious* grid_cell = grid_cells + local_index;
-            link_particle_to_cell(grid_cell, cell);
+            *particle = *particle_recv;
+            pc->particle= particle;
+            int global_i = global_x+2+(global_xd+4)*(global_y+2);
+            pc->global_i = global_i;
+            ParticleNodePredecessor* g = particle_grid+global_i;
+            linkParticle(g, pc);
         }
     }
-    buffer.receive_count = 0;
+    incoming.recvcnt = 0;
 }
 
-void simulate_one_step(particle_t* particles, int particle_count, double simulation_size, int process_rank, int process_count) {
-    // Exchange ghost particles.
-    // Step 1: exchange along dimension 0.
-    push_ghosts(X_AXIS, NEGATIVE);
-    push_ghosts(X_AXIS, POSITIVE);
-    neighbor_exchange(X_AXIS);
-    receive_particles(particles, particle_cells, grid_cells, X_AXIS, NEGATIVE, true, GHOST);
-    receive_particles(particles, particle_cells, grid_cells, X_AXIS, POSITIVE, true, GHOST);
-
-    // Step 2: exchange along dimension 1, including incoming particles from step 1.
-    push_ghosts(Y_AXIS, NEGATIVE);
-    push_ghosts(Y_AXIS, POSITIVE);
-    neighbor_exchange(Y_AXIS);
-    receive_particles(particles, particle_cells, grid_cells, Y_AXIS, NEGATIVE, false, GHOST);
-    receive_particles(particles, particle_cells, grid_cells, Y_AXIS, POSITIVE, false, GHOST);
-
-    // Compute Forces
-    for (int y = 1; y < LOCAL_GRID_HEIGHT + 3; ++y) {
-        for (int x = 1; x < LOCAL_GRID_WIDTH + 3; ++x) {
-            int index = x + (LOCAL_GRID_WIDTH + 4) * y;
-            for (ParticleCell* cell = grid_cells[index].next; cell != nullptr; cell = cell->next) {
-                particle_t* particle = cell->particle;
-                apply_cell_interactions(particle, x - 1, y - 1);
-                apply_cell_interactions(particle, x, y - 1);
-                apply_cell_interactions(particle, x + 1, y - 1);
-                apply_cell_interactions(particle, x - 1, y);
-                //apply_cell_interactions(particle, x, y);
-                //apply_cell_interactions(particle, x + 1, y);
-                apply_cell_interactions(particle, x - 1, y + 1);
-                //apply_cell_interactions(particle, x, y + 1);
-                //apply_cell_interactions(particle, x + 1, y + 1);
-                for (ParticleCell* neighbor_cell = cell->next; neighbor_cell != nullptr; neighbor_cell = neighbor_cell->next) {
-                  apply_particle_interaction(*particle, *(neighbor_cell->particle));
-                }
-            }
+void simulate_one_step(particle_t* parts, int n_parts, double size, int rank, int num_procs) 
+{
+    // Ghost particles interactions.
+    // Along dimension 0.
+    push_ghosts(X_Dim, Down);
+    push_ghosts(X_Dim, Up);
+    neighbor_exchange(X_Dim);
+    receive_particles(parts, particle_containers, particle_grid, X_Dim, Down, true, Ghost);
+    receive_particles(parts, particle_containers, particle_grid, X_Dim, Up, true, Ghost);
+    // Along dimension 1, including particles from previous.
+    push_ghosts(Y_Dim, Down);
+    push_ghosts(Y_Dim, Up);
+    neighbor_exchange(Y_Dim);
+    receive_particles(parts, particle_containers, particle_grid, Y_Dim, Down, false, Ghost);
+    receive_particles(parts, particle_containers, particle_grid, Y_Dim, Up, false, Ghost);
+    // Apply Forces
+    for (int gy = 1; gy < global_yd+3; ++gy) {
+      for (int gx = 1; gx < global_xd+3; ++gx) {
+        int i = gx+(global_xd+4)*gy;
+        for (ParticleNode* pc = particle_grid[i].next; pc != nullptr; pc = pc->next) {
+            particle_t* particle = pc->particle;
+            apply_intercell_force(particle, gx-1, gy-1);
+            apply_intercell_force(particle, gx, gy-1);
+            apply_intercell_force(particle, gx+1, gy-1);
+            apply_intercell_force(particle, gx-1, gy);
+            for (ParticleNode* pc_prime = pc->next; pc_prime != nullptr; pc_prime = pc_prime->next) apply_force(*particle, *pc_prime->particle);
         }
+      }
     }
 
     // Move Particles
-    for (auto it = owned_particles.begin(); it != owned_particles.end();) {
-        int particle_index = *it;
-        ParticleCell* cell = particle_cells + particle_index;
-        particle_t* particle = particles + particle_index;
-        update_particle_position(*particle, simulation_size);
-        particle->ax = particle->ay = 0;
-
-        int global_x_new = static_cast<int>(particle->x / CELL_SIZE) - GLOBAL_X_OFFSET;
-        int global_y_new = static_cast<int>(particle->y / CELL_SIZE) - GLOBAL_Y_OFFSET;
-        int local_index_new = global_x_new + 2 + (LOCAL_GRID_WIDTH + 4) * (global_y_new + 2);
-
-        if (cell->grid_index != local_index_new) {
-            if (global_x_new < 0 || global_x_new >= LOCAL_GRID_WIDTH || global_y_new < 0 || global_y_new >= LOCAL_GRID_HEIGHT) {
-                unlink_particle_from_cell(cell);
-                it = owned_particles.erase(it);
-
-                if (global_x_new < 0) {
-                    neighbor_buffers[X_AXIS][NEGATIVE].add_particle(*particle);
-                } else if (global_x_new >= LOCAL_GRID_WIDTH) {
-                    neighbor_buffers[X_AXIS][POSITIVE].add_particle(*particle);
-                } else if (global_y_new < 0) {
-                    neighbor_buffers[Y_AXIS][NEGATIVE].add_particle(*particle);
-                } else if (global_y_new >= LOCAL_GRID_HEIGHT) {
-                    neighbor_buffers[Y_AXIS][POSITIVE].add_particle(*particle);
-                }
-                continue;
+    for (auto it = global_parts.begin(); it != global_parts.end(); ) {
+        int p_i = *it;
+        ParticleNode* pc = particle_containers+p_i;
+        particle_t* particle = parts+p_i;
+        move(*particle, size);
+            particle->ax = particle->ay = 0;
+        int global_x_prime = static_cast<int>(particle->x / grid_step)-global_x0;
+        int global_y_prime = static_cast<int>(particle->y / grid_step)-global_y0;
+        int global_i_prime = global_x_prime+2+(global_xd+4)*(global_y_prime+2);
+        if (pc->global_i != global_i_prime) {
+            if (global_x_prime < 0 || global_x_prime >= global_xd || global_y_prime < 0 || global_y_prime >= global_yd) {
+              unlinkParticle(pc);
+              it = global_parts.erase(it);
+              if (global_x_prime < 0) {
+                neighbors[X_Dim][Down].push(*particle);
+              } else if (global_x_prime >= global_xd) {
+                neighbors[X_Dim][Up].push(*particle);
+              } else if (global_y_prime < 0) {
+                neighbors[Y_Dim][Down].push(*particle);
+              } else if (global_y_prime >= global_yd) {
+                neighbors[Y_Dim][Up].push(*particle);
+              }
+              continue;
             }
-            ParticleCellPrevious* grid_cell_new = grid_cells + local_index_new;
-            cell->grid_index = local_index_new;
-            unlink_particle_from_cell(cell);
-            link_particle_to_cell(grid_cell_new, cell);
+            ParticleNodePredecessor* global_prime = particle_grid+global_i_prime;
+            pc->global_i = global_i_prime;
+            unlinkParticle(pc);
+            linkParticle(global_prime, pc);
         }
         ++it;
     }
 
-    for (const int particle_index : ghost_particles) {
-        unlink_particle_from_cell(particle_cells + particle_index);
+    for (const int p_i: global_ghosts) {
+        unlinkParticle(particle_containers+p_i);
     }
-    ghost_particles.clear();
 
-    // Exchange moved particles.
-    // Step 1: exchange along dimension 0.
-    neighbor_exchange(X_AXIS);
-    receive_particles(particles, particle_cells, grid_cells, X_AXIS, NEGATIVE, true, OWNED);
-    receive_particles(particles, particle_cells, grid_cells, X_AXIS, POSITIVE, true, OWNED);
-
-    // Step 2: exchange along dimension 1, including incoming particles from step 1.
-    neighbor_exchange(Y_AXIS);
-    receive_particles(particles, particle_cells, grid_cells, Y_AXIS, NEGATIVE, false, OWNED);
-    receive_particles(particles, particle_cells, grid_cells, Y_AXIS, POSITIVE, false, OWNED);
+    global_ghosts.clear();
+    // Move particles.
+    // interaction along dim 0.
+    neighbor_exchange(X_Dim);
+    receive_particles(parts, particle_containers, particle_grid, X_Dim, Down, true, Owned);
+    receive_particles(parts, particle_containers, particle_grid, X_Dim, Up, true, Owned);
+    // interaction along dim 1
+    neighbor_exchange(Y_Dim);
+    receive_particles(parts, particle_containers, particle_grid, Y_Dim, Down, false, Owned);
+    receive_particles(parts, particle_containers, particle_grid, Y_Dim, Up, false, Owned);
 }
 
-
-void gather_for_save(particle_t* particles, int particle_count, double simulation_size, int process_rank, int process_count) {
-    MPI_Barrier(WORLD_COMM);
-
-    std::vector<particle_t> send_particles;
-    send_particles.reserve(owned_particles.size());
-
-    for (const int particle_index : owned_particles) {
-        send_particles.push_back(particles[particle_index]);
+void gather_for_save(particle_t* parts, int n_parts, double size, int rank, int num_procs) {
+    // Write this function such that at the end of it, the master (rank == 0)
+    // processor has an in-order view of all particles. That is, the array
+    // parts is complete and sorted by particle id.
+    MPI_Barrier(global_comm);
+    std::vector<particle_t> send;
+    send.reserve(global_parts.size());
+    std::vector<particle_t> recv;
+    for (const int p_i: global_parts) {
+        send.push_back(parts[p_i]);
     }
-
-    int send_count = send_particles.size();
-    int* receive_counts = nullptr;
-    int* receive_displacements = nullptr;
-    std::vector<particle_t> received_particles;
-
-    if (process_rank == 0) {
-        receive_counts = new int[process_count];
-        receive_displacements = new int[process_count];
+    int sendcount = send.size();
+    int* recvcounts, *recvdispls;
+    if (rank == 0) {
+        recvcounts = new int[num_procs];
+        recvdispls = new int[num_procs];
     }
-
-    MPI_Barrier(WORLD_COMM);
-    MPI_Gather(&send_count, 1, MPI_INT, receive_counts, 1, MPI_INT, 0, WORLD_COMM);
-
-    if (process_rank == 0) {
-        receive_displacements[0] = 0;
-        for (int i = 1; i < process_count; ++i) {
-            receive_displacements[i] = receive_displacements[i - 1] + receive_counts[i - 1];
+    MPI_Barrier(global_comm);
+    MPI_Gather(&sendcount, 1, MPI_INT, recvcounts, 1, MPI_INT, 0, global_comm);
+    if (rank == 0) {
+        recvdispls[0] = 0;
+        for (int i = 1; i < num_procs; ++i) recvdispls[i] = recvdispls[i-1]+recvcounts[i-1];
+        recv.resize(recvdispls[num_procs-1]+recvcounts[num_procs-1]);
+    }
+    MPI_Barrier(global_comm);
+    MPI_Gatherv(send.data(), sendcount, PARTICLE, recv.data(), recvcounts, recvdispls, PARTICLE, 0, global_comm);
+    if (rank == 0) {
+        for (const auto& particle_recv: recv) {
+            int p_i = particle_recv.id - 1;
+            parts[p_i] = particle_recv;
         }
-        int total_received = receive_displacements[process_count - 1] + receive_counts[process_count - 1];
-        received_particles.resize(total_received);
-    }
-
-    MPI_Barrier(WORLD_COMM);
-    MPI_Gatherv(send_particles.data(), send_count, PARTICLE, received_particles.data(), receive_counts, receive_displacements, PARTICLE, 0, WORLD_COMM);
-
-    if (process_rank == 0) {
-        for (const auto& received_particle : received_particles) {
-            int original_index = received_particle.id - 1;
-            particles[original_index] = received_particle;
-        }
-    }
-
-    if (process_rank == 0) {
-        delete[] receive_counts;
-        delete[] receive_displacements;
     }
 }
